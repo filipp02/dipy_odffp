@@ -1,8 +1,10 @@
 '''
 Created on Feb 18, 2021
-
+Updated on Jul 19, 2024 by @jadaily
 @author: patrykfi
 '''
+
+from sklearn.decomposition import TruncatedSVD
 
 import os, gzip
 import h5py, hdf5storage
@@ -321,7 +323,7 @@ class OdffpDictionary(DiffusionDataGenerator):
     def generate(self, dict_size=1000000, max_peaks_num=3, equal_fibers=False,
                  p_iso=[0.0,1.0], p_fib=[0.0,1.0], f_in=[0.0,1.0], 
                  D_iso=[2.0,3.0], D_a=[1.5,2.5], D_e=[1.5,2.5], D_r=[0.5,1.5],
-                 max_chunk_size=10000, odf_recon_model=None, 
+                 max_chunk_size=10000, odf_recon_model=None,
                  assert_faster_D_a=False, tortuosity_approximation=False):
            
         if odf_recon_model is None:
@@ -704,85 +706,54 @@ class OdffpModel(object):
         output_matrix[mask] = vector
         return output_matrix
 
+    # This method combines optimized version with truncated SVD
+    # Took 675.486 seconds (Most optimized method)
 
-    # def _find_matching_odf_trace(self, input_odf_trace, dict_odf_trace, penalty, max_chunk_size):
-    #     dot_product = np.dot(input_odf_trace, dict_odf_trace)
-    #
-    #     if penalty > 0.0:
-    #         dict_size = len(self._dict.peaks_per_voxel)
-    #         for chunk_idx in np.split(range(dict_size), range(max_chunk_size, dict_size, max_chunk_size)):
-    #             dot_product[:,chunk_idx] = np.log(dot_product[:,chunk_idx]) - 2 * penalty * self._dict.peaks_per_voxel[chunk_idx]
-    #
-    #     return np.argmax(dot_product, axis=1) 
-
-
-    # def _find_matching_odf_trace(self, input_odf_trace, dict_odf_trace, penalty):
-    #     input_odf_trace_num = input_odf_trace.shape[0]
-    #
-    #     max_dot_product_values = np.zeros((self._dict.max_peaks_num+1, input_odf_trace_num))
-    #     max_dot_product_dict_idx = np.zeros((self._dict.max_peaks_num+1, input_odf_trace_num), dtype=int)
-    #
-    #     for peak_id in range(self._dict.max_peaks_num+1):
-    #         peak_filter = np.array(self._dict.peaks_per_voxel == peak_id)
-    #         if ~np.any(peak_filter):
-    #             peak_filter[0] = True
-    #
-    #         peak_filter_idx = np.arange(len(self._dict.peaks_per_voxel))[peak_filter]
-    #
-    #         dot_product = np.dot(input_odf_trace, dict_odf_trace[:,peak_filter])
-    #         max_dot_product_idx = np.argmax(dot_product, axis=1)
-    #         max_dot_product_dict_idx[peak_id] = peak_filter_idx[max_dot_product_idx] 
-    #         max_dot_product_values[peak_id] = dot_product[
-    #             np.arange(input_odf_trace_num),
-    #             max_dot_product_idx
-    #         ]
-    #
-    #     if penalty > 0.0:
-    #         max_dot_product_values = np.log(max_dot_product_values) - 2 * penalty * np.atleast_2d(np.arange(self._dict.max_peaks_num+1)).T
-    #
-    #     return max_dot_product_dict_idx[
-    #         np.argmax(max_dot_product_values, axis=0),
-    #         np.arange(input_odf_trace_num)
-    #     ]
-        
-    def _find_matching_odf_trace(self, input_odf_trace, dict_odf_trace, penalty):
-    
+    def _find_matching_odf_trace(self, input_odf_trace, dict_odf_trace, penalty, n_components=10):
         try:
-            input_odf_trace_num = input_odf_trace.shape[0]
-    
-            max_dot_product_values = np.zeros((self._dict.max_peaks_num+1, input_odf_trace_num))
-            max_dot_product_dict_idx = np.zeros((self._dict.max_peaks_num+1, input_odf_trace_num), dtype=int)
-    
-            for peak_id in range(self._dict.max_peaks_num+1):
-                peak_filter = np.array(self._dict.peaks_per_voxel == peak_id)
-                if ~np.any(peak_filter):
-                    peak_filter[self._dict.IDX_ISO] = True
-                
-                peak_filter_idx = np.arange(len(self._dict.peaks_per_voxel))[peak_filter]
-    
-                dot_product = np.dot(input_odf_trace, dict_odf_trace[:,peak_filter])
+            # Utilizes the TruncatedSVD function for dimension reduction
+            svd = TruncatedSVD(n_components=n_components)
+            reduced_dict_odf_trace = svd.fit_transform(dict_odf_trace.T).T
+            reduced_input_odf_trace = svd.transform(input_odf_trace)
+
+            # Stores max_peaks_num as another variable for later
+            input_odf_trace_num = reduced_input_odf_trace.shape[0]
+            max_peaks_num = self._dict.max_peaks_num
+
+            max_dot_product_values = np.zeros((self._dict.max_peaks_num + 1, input_odf_trace_num))
+            max_dot_product_dict_idx = np.zeros((self._dict.max_peaks_num + 1, input_odf_trace_num), dtype=int)
+
+            # Uses list comprehension to limit computations for peak_filters indices
+            peak_filters = np.array([self._dict.peaks_per_voxel == peak_id for peak_id in range(max_peaks_num + 1)])
+            peak_filters[~np.any(peak_filters, axis=1), self._dict.IDX_ISO] = True
+            peak_filters_indices = [np.where(peak_filter)[0] for peak_filter in peak_filters]
+
+
+            for peak_id in range(self._dict.max_peaks_num + 1):
+                peak_filter_idx = peak_filters_indices[peak_id]
+
+                dot_product = np.dot(reduced_input_odf_trace, reduced_dict_odf_trace[:, peak_filter_idx])
                 max_dot_product_idx = np.argmax(dot_product, axis=1)
-                max_dot_product_dict_idx[peak_id] = peak_filter_idx[max_dot_product_idx] 
+                max_dot_product_dict_idx[peak_id] = peak_filter_idx[max_dot_product_idx]
                 max_dot_product_values[peak_id] = dot_product[
                     np.arange(input_odf_trace_num),
                     max_dot_product_idx
                 ]
-    
+
             # Penalization begins at the 2nd fiber
             if penalty > 0.0:
                 max_dot_product_values = np.log(max_dot_product_values) - 2 * penalty * np.atleast_2d(
                     np.hstack((0, np.arange(self._dict.max_peaks_num)))
                 ).T
-    
+
         except:
             return self._find_matching_odf_trace(input_odf_trace, dict_odf_trace, penalty)
 
         return max_dot_product_dict_idx[
             np.argmax(max_dot_product_values, axis=0),
             np.arange(input_odf_trace_num)
-        ]        
+        ]
 
-   
     def fit(self, data, mask=None, max_chunk_size=1000, penalty = DEFAULT_FIT_PENALTY):
         max_chunk_size = np.maximum(1, max_chunk_size)
         penalty = np.maximum(0.0, np.minimum(MAX_FIT_PENALTY, penalty))
